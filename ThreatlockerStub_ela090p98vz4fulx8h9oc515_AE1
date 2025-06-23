@@ -1,0 +1,594 @@
+#!/bin/bash
+
+set -e
+trap cleanup SIGHUP SIGINT SIGQUIT SIGABRT SIGALRM SIGTERM
+export DEBIAN_FRONTEND=noninteractive
+
+VERSION="2.0.0-692"
+echo "ThreatlockerStub version: $VERSION"
+
+###############################################################################
+#               Versions. Must be reviewed after each new release             #
+###############################################################################
+: "${MIN_VERSION_1_0:="1.0.5-278"}"
+: "${MIN_VERSION_1_0_5:="1.0.5-290"}"
+: "${MIN_VERSION_1_1:="1.1.0-297"}"
+: "${MIN_VERSION_1_2:="1.2.0-318"}"
+: "${MIN_VERSION_1_3:="1.3.0-495"}"
+: "${MIN_VERSION_1_4:="1.4.0-505"}"
+
+declare -A UPDATE_PATHS_TO_VERSIONS
+UPDATE_PATHS_TO_VERSIONS["1.0"]=$MIN_VERSION_1_0
+UPDATE_PATHS_TO_VERSIONS["1.0.5"]=$MIN_VERSION_1_0_5
+UPDATE_PATHS_TO_VERSIONS["1.1"]=$MIN_VERSION_1_1
+UPDATE_PATHS_TO_VERSIONS["1.2"]=$MIN_VERSION_1_2
+UPDATE_PATHS_TO_VERSIONS["1.3"]=$MIN_VERSION_1_3
+UPDATE_PATHS_TO_VERSIONS["1.4"]=$MIN_VERSION_1_4
+
+printOsByUpdatePath()
+{
+    local version=$1
+    if [[ $version == "1.1" || $version == "1.2" || $version == "1.0.5" || $version == "1.0" ]]; then
+        echo "ThreatLocker agent $version is available on RHEL 9 and Ubuntu 22.04 systems"
+    elif [[ $version == "1.3" ]]; then
+        echo "ThreatLocker agent $version is available on Oracle 7.9; RHEL 7, 8, 9; Ubuntu 20.04, 22.04, 24.04 systems"
+    elif [[ $version == "1.4" ]]; then
+        echo "ThreatLocker agent $version is available on Oracle 7.9; Oracle 9.4; RHEL 7, 8, 9; CentOs 8; Ubuntu 16.04, 18.04, 20.04, 22.04, 24.04 systems"
+    else
+        echo "Unknown version $version. Update ThreatLocker Stub Installer"
+    fi
+}
+###############################################################################
+
+###############################################################################
+#                               Global variables                              #
+###############################################################################
+TMP_THREATLOCKER_DIR="/tmp/threatlocker"
+LOG_FILE="/var/log/threatlockerInstaller.log"
+###############################################################################
+
+###############################################################################
+#                               Logging                                       #
+###############################################################################
+logToFile()
+{
+    local log_level=$1
+    shift 1
+    local message=$@
+
+    printf "$(date '+%F %T') [${log_level^^}] ThreatLockerInstaller: $message\n" >> $LOG_FILE
+}
+
+logInfoToFile()
+{
+    logToFile "INFO" $@
+}
+
+logErrorToFile()
+{
+    logToFile "ERROR" $@
+}
+###############################################################################
+
+
+###############################################################################
+#                               Utils                                         #
+###############################################################################
+printHelp()
+{
+    echo "ThreatLocker Stub installer"
+    echo "Template name for installer: ThreatlockerStub[_<Key>][_<Instance>]"
+    echo "Usage: <path to installer>/ThreatlockerStub[_<Key>][_<Instance>] [Options]"
+    echo "Available options:"
+    echo
+    echo "   --install-key              InstallKey which is used for registering computer (alternatively can be passed in installer name)"
+    echo "   --company                  Company name used with Group Name and Auth key (can't be used together with InstallKey)"
+    echo "   --group-name               Group name used with Company Name and Auth key (can't be used together with InstallKey)"
+    echo "   --key                      Auth key used with Group Name and Company name (can't be used together with InstallKey)"
+    echo "   --instance                 Instance used for generating API URL (alternatively can be passed in installer name)"
+    echo "   --help                     Print this message"
+    echo
+}
+
+cleanup()
+{
+    if [[ -d $TMP_THREATLOCKER_DIR ]]; then
+        rm -rf $TMP_THREATLOCKER_DIR
+    fi
+}
+
+cleanExit()
+{
+    local ret=$1
+
+    logInfoToFile "Exiting with code: $ret"
+    cleanup
+    exit $ret
+}
+
+registerComputer()
+{
+    local key=$1
+    local instance=$2
+
+    logInfoToFile "Registering computer using key $key and instance $instance"
+    
+    # Sleep for 5 seconds before registration to make sure agent is started
+    sleep 5
+
+    if [[ -n $instance ]]; then
+        if [[ "$instance" == "dev" ]]; then
+            threatlockerctl --custom-api https://devapi.threatlocker.com/
+            threatlockerctl --register-api-name devapi
+        else
+            threatlockerctl --custom-api https://api.$instance.threatlocker.com/
+        fi
+    fi
+
+    threatlockerctl --register-computer $install_key
+}
+###############################################################################
+
+###############################################################################
+#                            ThreatLocker API                                 #
+###############################################################################
+generateThreatlockerGetGroupKeyEndpoint() 
+{
+	local instance=$1
+
+    if [[ -n $instance ]]; then
+        if [[ "$instance" == "dev" ]]; then
+            echo "https://devapi.threatlocker.com/getgroupkey.ashx"
+        else
+            echo "https://api.$instance.threatlocker.com/getgroupkey.ashx"
+        fi
+    else
+        echo "https://api.threatlocker.com/getgroupkey.ashx"
+    fi
+}
+
+generateThreatlockerEndpointWithPackages()
+{
+    local update_path=$1
+    local instance=$2
+
+    if [[ "$instance" == "dev" ]]; then
+        echo "https://devupdates.threatlocker.com/repository/Linux/$update_path/threatlocker.tar.gz"
+    else
+        echo "https://updates.threatlocker.com/repository/Linux/$update_path/threatlocker.tar.gz"
+    fi
+}
+
+parseKeyValue()
+{
+    local response=$1
+    local expected_key=$2
+
+    local name="${response%:*}"
+    local value="${response#*:}"
+
+    if [[ $name != "$expected_key" || -z $value ]]; then
+        cleanExit 1
+    fi
+
+    echo "$value"
+}
+
+parseUpdatePath()
+{
+    local response=$1
+    logInfoToFile "Parsing update path from: $response"
+    parseKeyValue "$response" "URL"
+}
+
+parseInstallKey()
+{
+    local response=$1
+    logInfoToFile "Parsing install key from: $response"
+    parseKeyValue "$response" "InstallKey"
+}
+
+getUpdatePathByInstallKey()
+{
+    local instance=$1
+	local install_key=$2
+    local group_name=$3
+
+    logInfoToFile "Getting update path by install key: $install_key"
+
+	if [[ -z $install_key ]]; then
+        local message="Group key not found"
+        logErrorToFile $message
+		echo $message >&2
+		cleanExit 1
+	fi
+
+	local endpoint=$(generateThreatlockerGetGroupKeyEndpoint "$instance")
+    logInfoToFile "Using endpoint: $endpoint"
+	local response=$(curl -s -H "InstallKey: $install_key" -H "GroupName: $group_name" "$endpoint")
+	
+    local update_path=$(parseUpdatePath "$response")
+    if [[ -z $update_path ]]; then
+		local message="Group key $install_key, Group name $group_name or Instance name $instance is invalid in response: $response"
+		logErrorToFile $message
+        echo $message >&2
+        cleanExit 1
+	fi
+
+    logInfoToFile "Received update path: $update_path"
+    echo "$update_path"
+}
+
+getInstallKeyWithUpdatePathByAuthKey() {
+	local instance=$1
+	local company=$2
+	local authorization_key=$3
+    local groupName=$4
+
+    logInfoToFile "Getting install key with update by company $company, auth key $authorization_key and group name $groupName"
+
+	local endpoint=$(generateThreatlockerGetGroupKeyEndpoint "$instance")
+    logInfoToFile "Using endpoint: $endpoint"
+	local response=$(curl -s -H "GroupName: $groupName" -H "Authorization: $authorization_key" -H "OrganizationName: $company" "$endpoint")
+	local first=$(head -n 1 <<< "$response" | tr -d '\r')
+	local second=$(tail -n 1 <<< "$response")
+
+	local install_key=$(parseInstallKey "$first")
+    if [[ -z $install_key ]]; then
+		local message="Company $company, Authorization key $authorization_key, Group name $group_name or Instance name $instance is invalid in response: $response"
+		echo $message >&2
+        logErrorToFile $message
+        cleanExit 1
+	fi
+
+    local update_path=$(parseUpdatePath "$second")
+    if [[ -z $update_path ]]; then
+		local message="Company $company, Authorization key $authorization_key, Group name $group_name or Instance name $instance is invalid in response: $response"
+		echo $message >&2
+        logErrorToFile $message
+        cleanExit 1
+	fi
+
+    logInfoToFile "Parsed key: $install_key and update path: $update_path"
+
+    echo "$install_key $update_path"
+}
+###############################################################################
+
+
+###############################################################################
+#                                   Packages                                  #
+###############################################################################
+getPackageManager()
+{
+    if command -v yum >/dev/null; then
+        logInfoToFile "Found yum package manager"
+        package_manager="yum"
+    elif command -v apt-get >/dev/null; then
+        logInfoToFile "Found apt-get package manager"
+        package_manager="apt-get"
+    else
+        local message="No package manager available"
+        logErrorToFile $message
+        echo $message >&2
+        cleanExit 1
+    fi
+
+    echo $package_manager
+}
+
+#TODO: Manage this zoo of Linux distributions versions in a better way
+selectAgentPackage()
+{
+    local folder=$1
+    local arch=$2
+    local update_path=$3
+
+    logInfoToFile "Looking for agent package"
+    
+    source /etc/os-release
+    # Starting from 1.4 version RHEL == CentOs
+    if [[ $ID == 'rhel' || ($(compareVersions $update_path "1.4") -ge 0 && $ID == 'centos') ]]; then
+        # on RHEL we use only major number of release, e. g. 7.9 -> 7, 8.10 -> 8
+        local version=$(echo "$VERSION_ID" | cut -d'.' -f1)
+        os="rhel_$version"
+    elif [[ $ID == 'ubuntu' ]]; then
+        # on Ubuntu need to trim zero in the minor version and replace dot with undescore, e. g. 22.04 -> 22_4
+        local version=$(echo "$VERSION_ID" | awk -F'.' '{print $1 "_" int($2)}')
+        os="ubuntu_$version"
+    elif [[ $ID == 'ol' ]]; then
+        os="ol_7_9"
+    else
+        local message="Unknown OS: $PRETTY_NAME"
+        logErrorToFile $message
+        echo $message >&2
+        return
+    fi
+
+    local package_manager=$(getPackageManager)
+    if [[ $package_manager == "apt-get" ]]; then
+        extension='deb'
+    elif [[ $package_manager == "yum" ]]; then
+        extension='rpm'
+    else
+        local message="Unknown package type"
+        logErrorToFile $message
+        echo $message >&2
+        return
+    fi
+
+
+    local regex="$folder/[0-9]+\.[0-9]+\.[0-9]+\-[0-9]+_$os\.$arch\.$extension"
+    logInfoToFile "Regex to find package with agent: $regex"
+    echo $(find "$folder" -type f -regex "$regex")
+}
+
+selectModulesPackage()
+{
+    local folder=$1
+
+    logInfoToFile "Looking for modules package"
+
+    local regex="$folder/threatlocker_[0-9]+\.[0-9]+\.[0-9]+\-[0-9]+_modules\."
+    local package_manager=$(getPackageManager)
+    if [[ $package_manager == "apt-get" ]]; then
+        regex="${regex}deb"
+    elif [[ $package_manager == "yum" ]]; then
+        regex="${regex}rpm"
+    else
+        local message="Unknown package type"
+        logErrorToFile $message
+        echo $message >&2
+        cleanExit 1
+    fi
+
+    logInfoToFile "Regex to find package with modules: $regex"
+
+    echo $(find "$folder" -type f -regex "$regex")
+}
+
+populateInstallerWithKeyAndInstance()
+{
+    local installer=$1
+    local key=$2
+    local instance=$3
+
+    # Using ThreatLocker_<key>_<instance>.[deb|rpm] naming to make registering automatically
+    local new_installer="${TMP_THREATLOCKER_DIR}/ThreatLocker_${key}"
+    if [[ -n $instance ]]; then
+        new_installer="${new_installer}_${instance}"
+    fi
+    new_installer="${new_installer}.${installer##*.}"
+    logInfoToFile "Moving $installer to $new_installer"
+    mv $installer $new_installer
+    echo $new_installer
+}
+
+# Returns 0 if versions are equal
+# Returns 1 if the first version is greater
+# Returns -1 if the first version is lesser
+compareVersions() 
+{
+    local version_a=$1
+    local version_b=$2
+
+    if ([[ $version_a == $version_b ]]); then
+        echo 0
+        return
+    fi
+
+    local smallest_version=$(printf "%s\n%s" "$version_a" "$version_b" | sort --version-sort | head -n 1)
+    
+    if ([[ "$smallest_version" != "$version_b" ]]); then
+        echo -1
+    else
+        echo 1
+    fi
+}
+
+checkPackageVersion() 
+{
+    local downloaded_version=$1
+    local update_path=$2
+
+    local expected_version="${UPDATE_PATHS_TO_VERSIONS[$update_path]}"
+
+    if [[ -z "$expected_version" ]]; then
+        local message="$update_path version is not supported by Stub Installer"
+        echo $message >&2
+        logErrorToFile $message
+        cleanExit 1
+    fi
+
+    if [[ $(compareVersions $downloaded_version $expected_version) -ge 0  ]]; then
+        logInfoToFile "Downloaded version: $downloaded_version is good for $update_path"
+    else
+        local message="Stub Installer supports at least $expected_version version for $update_path, but received $downloaded_version"
+        logErrorToFile $message
+        echo $message >&2
+        cleanExit 1
+    fi
+}
+
+getPackageVersion()
+{
+    local path_to_package=$1
+
+    local package_manager=$(getPackageManager)
+    if [[ $package_manager == "apt-get" ]]; then
+        echo $(dpkg-deb --info $path_to_package | awk '/Version:/ {printf $2}')
+    elif [[ $package_manager == "yum" ]]; then
+        echo $(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' $path_to_package)
+    else
+        local message="Unknown package manager for getting version"
+        logErrorToFile $message
+        echo $message >&2
+        cleanExit 1
+    fi
+
+}
+###############################################################################
+
+###############################################################################
+#                                   Main                                      #
+###############################################################################
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Run installer as root"
+    cleanExit 1
+fi
+
+if [[ -f $LOG_FILE ]]; then
+    rm $LOG_FILE
+    logInfoToFile "Removed old log file $LOG_FILE"
+fi
+
+logInfoToFile "Starting Stub Installer: $0 $@"
+
+if [[ -d $TMP_THREATLOCKER_DIR ]]; then
+    logInfoToFile "Removing $TMP_THREATLOCKER_DIR"
+    rm -rf $TMP_THREATLOCKER_DIR
+fi
+
+# ThreatlockerStub_<Key>_<Instance>
+installer_name=$(basename "$0")
+values="${installer_name#ThreatlockerStub}"
+values="${values#_}"
+# Split by underscores
+IFS='_-'; read -r install_key instance <<< "${values}"; unset IFS
+logInfoToFile "From name: $0, install key - $install_key, instance - $instance"
+
+#TODO: parse Arch from stub installer name
+arch=x86_64
+
+#TODO: add uninstall, proxy-url, proxy-setting-url arguments
+ARGS=$(getopt -o h --long install-key:,company:,group-name:,key:,instance:,help -- "$@")
+if [ $? -ne 0 ]; then
+    logErrorToFile "Failed to parse arguments: $@"
+    printHelp
+    cleanExit 1
+fi
+
+eval set -- "$ARGS"
+while true; do
+    case "$1" in
+        --install-key)
+            install_key="$2"
+            shift 2
+            ;;
+        --company)
+            company="$2"
+            shift 2
+            ;;
+        --group-name)
+            group_name="$2"
+            shift 2
+            ;;
+        --key)
+            key="$2"
+            shift 2
+            ;;
+        --instance)
+            instance="$2"
+            shift 2
+            ;;
+        -h|--help)
+            printHelp
+            cleanExit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Unknown argument"
+            printHelp
+            cleanExit 1
+            ;;
+    esac
+done
+
+instance=${instance,,}
+
+
+if [[ -z $install_key && -z $key && -z $company && -z $group_name ]]; then
+    message="'InstallKey' or 'Key', 'Company' and 'GroupName' are not provided"
+    logErrorToFile $message
+    echo $message >&2
+    cleanExit 1
+fi
+
+if [[ -n $install_key && -n $key && -n $company && -n $group_name ]]; then
+    message="Either 'InstallKey' or 'Key', 'Company' and 'GroupName' must be provided"
+    logErrorToFile $message
+    echo $message >&2
+    cleanExit 1
+fi
+
+if [[ -z $install_key && ( -z $key || -z $company || -z $group_name) ]]; then
+    message="'Key', 'Company' and 'GroupName' must be provided together'"
+    logErrorToFile $message
+    echo $message >&2
+    cleanExit 1
+fi
+
+if [[ -n $install_key ]]; then
+    update_path=$(getUpdatePathByInstallKey "$instance" "$install_key" "$group_name")
+else
+    read install_key update_path <<< $(getInstallKeyWithUpdatePathByAuthKey "$instance" "$company" "$key" "$group_name")
+fi
+
+logInfoToFile "Update path = $update_path"
+
+mkdir -p $TMP_THREATLOCKER_DIR
+download_endpoint=$(generateThreatlockerEndpointWithPackages "$update_path" "$instance")
+logInfoToFile "Endpoint for downloading $download_endpoint"
+echo "Downloading installers $update_path version..."
+curl -s $download_endpoint > $TMP_THREATLOCKER_DIR/threatlocker.tar.gz
+echo "Download finished"
+mkdir -p $TMP_THREATLOCKER_DIR/packages
+logInfoToFile "Unpacking downloaded item"
+tar -xvzf $TMP_THREATLOCKER_DIR/threatlocker.tar.gz -C $TMP_THREATLOCKER_DIR/packages >> $LOG_FILE
+
+agent_package=$(selectAgentPackage "$TMP_THREATLOCKER_DIR/packages" "$arch" "$update_path")
+if [[ -z $agent_package ]]; then
+    printOsByUpdatePath "$update_path"
+    logErrorToFile "Failed to find package with agent"
+    cleanExit 1
+fi
+
+# if $update_path <= 1.4 provide check for minimal version
+if [[ $(compareVersions $update_path "1.4") -le 0 ]]; then
+    package_version=$(getPackageVersion "$agent_package")
+    checkPackageVersion "$package_version" "$update_path"
+fi
+
+modules_package=$(selectModulesPackage "$TMP_THREATLOCKER_DIR/packages")
+# Modules package must exists starting from 1.3.0-495 version
+if [[ -z "$modules_package" && $(compareVersions $package_version "1.3.0-495") -ge 0 ]]; then
+    message="Failed to find package with ThreatLocker modules"
+    echo $message
+    logErrorToFile $message
+    cleanExit 1
+fi
+
+package_manager=$(getPackageManager)
+logInfoToFile "Found package manager: $package_manager"
+
+if [[ -n "$modules_package" ]]; then
+    echo "Installing modules $modules_package"
+    "$package_manager" install -y "$modules_package" >> $LOG_FILE
+fi
+echo "Installing agent $agent_package"
+"$package_manager" install -y "$agent_package" >> $LOG_FILE
+if [[ ! $? ]]; then
+    message="Failed to install packages"
+    echo $message
+    logErrorToFile $message
+    cleanExit 1
+fi
+echo "Installation finished"
+
+# TODO: replace it with modyfing installer name, on newer versions
+registerComputer "$install_key" "$instance"
+
+cleanExit 0
